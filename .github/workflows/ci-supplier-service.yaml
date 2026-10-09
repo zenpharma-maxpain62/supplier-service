@@ -121,5 +121,5 @@ jobs:
           sed -i "s/$CURRENT_IMAGE_TAG/$IMAGE_TAG/g" envs/dev/values-supplier-service.yaml
 
           git add envs/dev/values-supplier-service.yaml
-          git commit -m "update: manufacturing service image tag to $IMAGE_TAG"
+          git commit -m "update: supplier service image tag to $IMAGE_TAG"
           git push
