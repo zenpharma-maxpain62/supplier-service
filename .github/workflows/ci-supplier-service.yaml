@@ -1,0 +1,124 @@
+name: ci supplier service
+on:
+  workflow_dispatch
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: checkout
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: fetch tag
+        id: fetch-tag
+        run: |
+          echo "tag=$(git describe --tag --abbrev=0)" >> "$GITHUB_OUTPUT"
+      
+      - name: setup java
+        uses: actions/setup-java@v6
+        with:
+          java-version: 17
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: compile, test, build
+        run: mvn verify --no-transfer-progress
+
+      - name: sonar scan
+        uses: SonarSource/sonarqube-scan-action@da4450e400cebf84292b12a85d4ca0080ae2938c
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+            -Dsonar.java.binaries=target/classes
+
+      - name: configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.1.0
+        with:
+          aws-region: ap-south-1
+          role-to-assume: arn:aws:iam::134448505602:role/zenpharma-dev-github-actions-role
+          audience: sts.amazonaws.com
+
+      - name: login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: build docker image
+        id: image-build
+        run: |
+          IMAGE=${{ steps.login-ecr.outputs.registry }}/supplier-service:${{ steps.fetch-tag.outputs.tag }}
+          docker build -t $IMAGE .
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.image-build.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-report.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          exit-code: 0
+          ignore-unfixed: true
+
+      - name: upload trivy report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: trivy-report.sarif
+          retention-days: 1
+      
+      - name: push docker image
+        run: |
+          IMAGE="${{ steps.image-build.outputs.image }}"
+          docker push $IMAGE
+
+  deploy:
+    name: deploy to gitops
+    permissions:
+      contents: write
+      id-token: write
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: fetch tag
+        id: fetch-tag
+        run: echo "tag=$(git describe --tag --abbrev=0)" >> "$GITHUB_OUTPUT"
+
+      - name: checkout gitops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: _gitops
+
+      - name: update image tag in gitops repo
+        run: |
+          cd _gitops
+          git pull
+
+          git config user.name "maxpain62"
+          git config user.email "maxpain62@gmail.com"
+
+          export IMAGE_TAG=${{ steps.fetch-tag.outputs.tag }}
+          export CURRENT_IMAGE_TAG=$(grep "tag:" envs/dev/values-supplier-service.yaml | awk '{print $2}')
+
+          echo "new image tag: $IMAGE_TAG"
+          echo "current image tag: $CURRENT_IMAGE_TAG"
+
+          sed -i "s/$CURRENT_IMAGE_TAG/$IMAGE_TAG/g" envs/dev/values-supplier-service.yaml
+
+          git add envs/dev/values-supplier-service.yaml
+          git push
